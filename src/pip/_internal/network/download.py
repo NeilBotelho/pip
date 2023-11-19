@@ -9,6 +9,7 @@ from functools import partial
 from typing import Iterable, Optional, Tuple
 
 from pip._vendor.requests.models import CONTENT_CHUNK_SIZE, Response
+from pip._vendor.rich.progress import Progress
 
 from pip._internal.cli.progress_bars import get_download_progress_renderer
 from pip._internal.exceptions import NetworkConnectionError
@@ -219,10 +220,16 @@ class BatchDownloader:
         links = list(links)
         max_workers = self._session.parallel_downloads
         if max_workers == 1 or len(links) == 1:
-            # TODO: set minimum number of links to perform parallel download
             for link in links:
-                yield self._sequential_download(link, location, self._progress_bar)
+                # New progress bar is needed for each link to prevent artifacts
+                # in Docker and jupyter
+                progress_bar = get_download_progress_renderer()
+                yield self._sequential_download(link, location, progress_bar, parallel=False)
         else:
-            results = self._download_parallel(links, location, max_workers)
-            for result in results:
-                yield result
+            progress_bar = get_download_progress_renderer()
+            with progress_bar:
+                results = self._download_parallel(
+                    links, location, max_workers, progress_bar
+                )
+                for result in results:
+                    yield result

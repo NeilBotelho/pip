@@ -149,8 +149,9 @@ def _http_get_download(session: PipSession, link: Link) -> Response:
 
 
 def _download(
-    link: Link, location: str, session: PipSession, progress_bar: str
+    link: Link, location: str, session: PipSession, progress_bar: Progress, parallel=False
 ) -> Tuple[str, str]:
+
     try:
         resp = _http_get_download(session, link)
     except NetworkConnectionError as e:
@@ -161,7 +162,7 @@ def _download(
     filename = _get_http_response_filename(resp, link)
     filepath = os.path.join(location, filename)
 
-    chunks = _prepare_download(resp, link, progress_bar)
+    chunks = _prepare_download(resp, link, progress_bar,parallel)
     with open(filepath, "wb") as content_file:
         for chunk in chunks:
             content_file.write(chunk)
@@ -180,7 +181,10 @@ class Downloader:
 
     def __call__(self, link: Link, location: str) -> Tuple[str, str]:
         """Download the file given by link into location."""
-        return _download(link, location, self._session, self._progress_bar)
+
+
+        progress_bar = get_download_progress_renderer()
+        return _download(link, location, self._session, progress_bar,parallel=False)
 
 
 class BatchDownloader:
@@ -193,17 +197,17 @@ class BatchDownloader:
         self._progress_bar = progress_bar
 
     def _sequential_download(
-        self, link: Link, location: str, progress_bar: str
+        self, link: Link, location: str, progress_bar: Progress, parallel=False
     ) -> Tuple[Link, Tuple[str, str]]:
-        filepath, content_type = _download(link, location, self._session, progress_bar)
+        filepath, content_type = _download(link, location, self._session, progress_bar,parallel=parallel)
         return link, (filepath, content_type)
 
     def _download_parallel(
-        self, links: Iterable[Link], location: str, max_workers: int
+        self, links: Iterable[Link], location: str, max_workers: int, progress_bar
     ) -> Iterable[Tuple[Link, Tuple[str, str]]]:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             _download_parallel = partial(
-                self._sequential_download, location=location, progress_bar="off"
+                self._sequential_download, location=location, progress_bar=progress_bar, parallel=True
             )
             results = list(pool.map(_download_parallel, links))
         return results

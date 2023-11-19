@@ -29,46 +29,73 @@ def _get_http_response_size(resp: Response) -> Optional[int]:
         return None
 
 
-def _prepare_download(
-    resp: Response,
-    link: Link,
-    progress_bar: str,
-) -> Iterable[bytes]:
-    total_length = _get_http_response_size(resp)
-
+def get_logged_url(link):
     if link.netloc == PyPI.file_storage_domain:
         url = link.show_url
     else:
         url = link.url_without_fragment
 
-    logged_url = redact_auth_from_url(url)
+    return redact_auth_from_url(url)
 
+
+def get_log_message(resp, link, total_length):
+    logged_url = get_logged_url(link)
     if total_length:
         logged_url = f"{logged_url} ({format_size(total_length)})"
 
     if is_from_cache(resp):
-        logger.info("Using cached %s", logged_url)
-    else:
-        logger.info("Downloading %s", logged_url)
+        return f"Using cached {logged_url}"
+    return f"Downloading {logged_url}"
 
+
+def _show_progress(resp, link, total_length):
     if logger.getEffectiveLevel() > logging.INFO:
         show_progress = False
     elif is_from_cache(resp):
         show_progress = False
+        # TODO: move this into the progress bar. Create a progress bar and advance it
+        # by total_length, so that it just logs the cache message and exits
+        # Using logging doesn't give synchronization gurantees in case of parallel progress
+        # bars. So it might mess up the rendering or not even show up
+        logger.info(get_log_message(resp,link,total_length))
     elif not total_length:
         show_progress = True
-    elif total_length > (40 * 1000):
-        show_progress = True
+    # This logic is moved into PipProgress.make_task_group
+    # elif total_length > (40 * 1000):
+    #     show_progress = True
     else:
-        show_progress = False
+        show_progress = True
+
+    return show_progress
+
+
+def _progress_iterator(chunks, progress_bar, task_id,parallel=False):
+    if not parallel:
+        with progress_bar:
+            for chunk in chunks:
+                progress_bar.update(task_id=task_id, advance=len(chunk))
+                yield chunk
+    else:
+        for chunk in chunks:
+            progress_bar.update(task_id=task_id, advance=len(chunk))
+            yield chunk
+
+
+def _prepare_download(
+    resp: Response,
+    link: Link,
+    progress_bar: Progress,
+    parallel=False
+) -> Iterable[bytes]:
+    total_length = _get_http_response_size(resp)
+    show_progress = _show_progress(resp, link, total_length)
 
     chunks = response_chunks(resp, CONTENT_CHUNK_SIZE)
-
     if not show_progress:
         return chunks
-
-    renderer = get_download_progress_renderer(bar_type=progress_bar, size=total_length)
-    return renderer(chunks)
+    description = get_log_message(resp, link, total_length)
+    task_id = progress_bar.add_task(description=description, total=total_length)
+    return _progress_iterator(chunks, progress_bar, task_id,parallel)
 
 
 def sanitize_content_filename(filename: str) -> str:

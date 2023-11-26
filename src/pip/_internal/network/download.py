@@ -9,7 +9,7 @@ from functools import partial
 from typing import Iterable, Optional, Tuple
 
 from pip._vendor.requests.models import CONTENT_CHUNK_SIZE, Response
-from pip._vendor.rich.progress import Progress
+from pip._vendor.rich.progress import Progress, TaskID
 
 from pip._internal.cli.progress_bars import get_download_progress_renderer
 from pip._internal.exceptions import NetworkConnectionError
@@ -30,7 +30,7 @@ def _get_http_response_size(resp: Response) -> Optional[int]:
         return None
 
 
-def get_logged_url(link):
+def get_logged_url(link: Link) -> str:
     if link.netloc == PyPI.file_storage_domain:
         url = link.show_url
     else:
@@ -39,7 +39,7 @@ def get_logged_url(link):
     return redact_auth_from_url(url)
 
 
-def get_log_message(resp, link, total_length):
+def get_log_message(resp: Response, link: Link, total_length: Optional[int]) -> str:
     logged_url = get_logged_url(link)
     if total_length:
         logged_url = f"{logged_url} ({format_size(total_length)})"
@@ -49,54 +49,49 @@ def get_log_message(resp, link, total_length):
     return f"Downloading {logged_url}"
 
 
-def _show_progress(resp, link, total_length):
-    if logger.getEffectiveLevel() > logging.INFO:
-        show_progress = False
-    elif is_from_cache(resp):
-        show_progress = False
-        # TODO: move this into the progress bar. Create a progress bar and advance it
-        # by total_length, so that it just logs the cache message and exits
-        # Using logging doesn't give synchronization gurantees in case of parallel progress
-        # bars. So it might mess up the rendering or not even show up
-        logger.info(get_log_message(resp,link,total_length))
-    elif not total_length:
-        show_progress = True
-    # This logic is moved into PipProgress.make_task_group
-    # elif total_length > (40 * 1000):
-    #     show_progress = True
+def _progress_iterator(
+    chunks: Iterable[bytes],
+    progress_bar: Progress,
+    task_id: TaskID,
+    parallel: bool = False,
+) -> Iterable[bytes]:
+    if parallel:
+        # Dont add a `with` for parallel downloads, since they are already in
+        # a `with` block
+        for chunk in chunks:
+            progress_bar.update(task_id=task_id, advance=len(chunk))
+            yield chunk
     else:
-        show_progress = True
-
-    return show_progress
-
-
-def _progress_iterator(chunks, progress_bar, task_id,parallel=False):
-    if not parallel:
         with progress_bar:
             for chunk in chunks:
                 progress_bar.update(task_id=task_id, advance=len(chunk))
                 yield chunk
-    else:
-        for chunk in chunks:
-            progress_bar.update(task_id=task_id, advance=len(chunk))
-            yield chunk
 
 
 def _prepare_download(
-    resp: Response,
-    link: Link,
-    progress_bar: Progress,
-    parallel=False
+    resp: Response, link: Link, progress_bar: Progress, parallel: bool = False
 ) -> Iterable[bytes]:
     total_length = _get_http_response_size(resp)
-    show_progress = _show_progress(resp, link, total_length)
 
     chunks = response_chunks(resp, CONTENT_CHUNK_SIZE)
-    if not show_progress:
-        return chunks
     description = get_log_message(resp, link, total_length)
-    task_id = progress_bar.add_task(description=description, total=total_length)
-    return _progress_iterator(chunks, progress_bar, task_id,parallel)
+
+    if is_from_cache(resp):
+        hide_progress = True
+    elif total_length and total_length <= (40 * 1000):
+        hide_progress = True
+    else:
+        hide_progress = False
+
+    task_id = progress_bar.add_task(
+        description=description,
+        total=total_length,
+        hide_progress=hide_progress,
+    )
+    if hide_progress and not parallel:
+        return chunks
+
+    return _progress_iterator(chunks, progress_bar, task_id, parallel)
 
 
 def sanitize_content_filename(filename: str) -> str:
@@ -150,9 +145,12 @@ def _http_get_download(session: PipSession, link: Link) -> Response:
 
 
 def _download(
-    link: Link, location: str, session: PipSession, progress_bar: Progress, parallel=False
+    link: Link,
+    location: str,
+    session: PipSession,
+    progress_bar: Progress,
+    parallel: bool = False,
 ) -> Tuple[str, str]:
-
     try:
         resp = _http_get_download(session, link)
     except NetworkConnectionError as e:
@@ -163,7 +161,7 @@ def _download(
     filename = _get_http_response_filename(resp, link)
     filepath = os.path.join(location, filename)
 
-    chunks = _prepare_download(resp, link, progress_bar,parallel)
+    chunks = _prepare_download(resp, link, progress_bar, parallel)
     with open(filepath, "wb") as content_file:
         for chunk in chunks:
             content_file.write(chunk)
@@ -183,9 +181,10 @@ class Downloader:
     def __call__(self, link: Link, location: str) -> Tuple[str, str]:
         """Download the file given by link into location."""
 
-
-        progress_bar = get_download_progress_renderer()
-        return _download(link, location, self._session, progress_bar,parallel=False)
+        progress_bar = get_download_progress_renderer(
+            progress_type=self._progress_bar, logger=logger
+        )
+        return _download(link, location, self._session, progress_bar, parallel=False)
 
 
 class BatchDownloader:
@@ -198,20 +197,47 @@ class BatchDownloader:
         self._progress_bar = progress_bar
 
     def _sequential_download(
-        self, link: Link, location: str, progress_bar: Progress, parallel=False
+        self, link: Link, location: str, progress_bar: Progress, parallel: bool = False
     ) -> Tuple[Link, Tuple[str, str]]:
-        filepath, content_type = _download(link, location, self._session, progress_bar,parallel=parallel)
+        filepath, content_type = _download(
+            link, location, self._session, progress_bar, parallel=parallel
+        )
         return link, (filepath, content_type)
 
     def _download_parallel(
-        self, links: Iterable[Link], location: str, max_workers: int, progress_bar
+        self,
+        links: Iterable[Link],
+        location: str,
+        max_workers: int,
+        progress_bar: Progress,
     ) -> Iterable[Tuple[Link, Tuple[str, str]]]:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            _download_parallel = partial(
-                self._sequential_download, location=location, progress_bar=progress_bar, parallel=True
+            _download_wrapper = partial(
+                self._sequential_download,
+                location=location,
+                progress_bar=progress_bar,
+                parallel=True,
             )
-            results = list(pool.map(_download_parallel, links))
+            results = list(pool.map(_download_wrapper, links))
         return results
+
+    def download_parallel(
+        self,
+        links: Iterable[Link],
+        location: str,
+        max_workers: int,
+        progress_bar: Progress,
+    ) -> Iterable[Tuple[Link, Tuple[str, str]]]:
+        # This is required because `with Progress` statements add a \n even if
+        # nothing is explicitly printed. So in case the user specifies -q a `with`
+        # block shouldn't be used
+        if logger.getEffectiveLevel() > logging.INFO:
+            return self._download_parallel(links, location, max_workers, progress_bar)
+        with progress_bar:
+            results = self._download_parallel(
+                links, location, max_workers, progress_bar
+            )
+            return results
 
     def __call__(
         self, links: Iterable[Link], location: str
@@ -223,13 +249,16 @@ class BatchDownloader:
             for link in links:
                 # New progress bar is needed for each link to prevent artifacts
                 # in Docker and jupyter
-                progress_bar = get_download_progress_renderer()
-                yield self._sequential_download(link, location, progress_bar, parallel=False)
-        else:
-            progress_bar = get_download_progress_renderer()
-            with progress_bar:
-                results = self._download_parallel(
-                    links, location, max_workers, progress_bar
+                progress_bar = get_download_progress_renderer(
+                    progress_type=self._progress_bar, logger=logger
                 )
-                for result in results:
-                    yield result
+                yield self._sequential_download(
+                    link, location, progress_bar, parallel=False
+                )
+        else:
+            progress_bar = get_download_progress_renderer(
+                progress_type=self._progress_bar, parallel=True
+            )
+            results = self.download_parallel(links, location, max_workers, progress_bar)
+            for result in results:
+                yield result

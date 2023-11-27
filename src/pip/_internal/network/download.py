@@ -9,9 +9,9 @@ from functools import partial
 from typing import Iterable, Optional, Tuple
 
 from pip._vendor.requests.models import CONTENT_CHUNK_SIZE, Response
-from pip._vendor.rich.progress import Progress, TaskID
+from pip._vendor.rich.progress import TaskID
 
-from pip._internal.cli.progress_bars import get_download_progress_renderer
+from pip._internal.cli.progress_bars import PipProgress, get_download_progress_renderer
 from pip._internal.exceptions import NetworkConnectionError
 from pip._internal.models.index import PyPI
 from pip._internal.models.link import Link
@@ -51,7 +51,7 @@ def get_log_message(resp: Response, link: Link, total_length: Optional[int]) -> 
 
 def _progress_iterator(
     chunks: Iterable[bytes],
-    progress_bar: Progress,
+    progress_bar: PipProgress,
     task_id: TaskID,
     parallel: bool = False,
 ) -> Iterable[bytes]:
@@ -69,7 +69,7 @@ def _progress_iterator(
 
 
 def _prepare_download(
-    resp: Response, link: Link, progress_bar: Progress, parallel: bool = False
+    resp: Response, link: Link, progress_bar: PipProgress, parallel: bool = False
 ) -> Iterable[bytes]:
     total_length = _get_http_response_size(resp)
 
@@ -79,6 +79,8 @@ def _prepare_download(
     if is_from_cache(resp):
         hide_progress = True
     elif total_length and total_length <= (40 * 1000):
+        hide_progress = True
+    elif progress_bar.progress_disabled:
         hide_progress = True
     else:
         hide_progress = False
@@ -148,7 +150,7 @@ def _download(
     link: Link,
     location: str,
     session: PipSession,
-    progress_bar: Progress,
+    progress_bar: PipProgress,
     parallel: bool = False,
 ) -> Tuple[str, str]:
     try:
@@ -197,7 +199,11 @@ class BatchDownloader:
         self._progress_bar = progress_bar
 
     def _sequential_download(
-        self, link: Link, location: str, progress_bar: Progress, parallel: bool = False
+        self,
+        link: Link,
+        location: str,
+        progress_bar: PipProgress,
+        parallel: bool = False,
     ) -> Tuple[Link, Tuple[str, str]]:
         filepath, content_type = _download(
             link, location, self._session, progress_bar, parallel=parallel
@@ -209,7 +215,7 @@ class BatchDownloader:
         links: Iterable[Link],
         location: str,
         max_workers: int,
-        progress_bar: Progress,
+        progress_bar: PipProgress,
     ) -> Iterable[Tuple[Link, Tuple[str, str]]]:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             _download_wrapper = partial(
@@ -226,7 +232,7 @@ class BatchDownloader:
         links: Iterable[Link],
         location: str,
         max_workers: int,
-        progress_bar: Progress,
+        progress_bar: PipProgress,
     ) -> Iterable[Tuple[Link, Tuple[str, str]]]:
         # This is required because `with Progress` statements add a \n even if
         # nothing is explicitly printed. So in case the user specifies -q a `with`

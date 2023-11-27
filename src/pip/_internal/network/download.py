@@ -93,6 +93,8 @@ def _prepare_download(
     if hide_progress and not parallel:
         return chunks
 
+    if logger.getEffectiveLevel() > logging.INFO:
+        return chunks
     return _progress_iterator(chunks, progress_bar, task_id, parallel)
 
 

@@ -207,7 +207,12 @@ class PipProgress(Progress):
             log_statement = f"{indentation}{description}"
             self.logger.info(log_statement)
         return super().add_task(
-            description=description, total=total, visible=visible, **fields
+            description=description,
+            start=start,
+            completed=completed,
+            total=total,
+            visible=visible,
+            **fields,
         )
 
 
